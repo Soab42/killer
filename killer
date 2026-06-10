@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-import curses, subprocess, os, glob, time, sys, signal, getpass
+import curses, subprocess, os, glob, time, sys, signal, getpass, threading
 
 CATEGORIES = ["All", "Browsers", "Communication", "Dev", "Creative", "Servers", "Background", "Other"]
+
+# Auto-kill threshold: when RAM% >= this, kill highest-RAM idle app (then any)
+RAM_WATCHDOG_PCT = 95
+# Consecutive low-CPU readings needed to mark an app "idle" (~16 s at 8 s interval)
+IDLE_CPU_THRESHOLD = 1.0   # percent
+IDLE_READINGS      = 2
 
 APPS = [
     # Browsers
@@ -109,7 +115,6 @@ APPS = [
 
 # ── Process scanner ──────────────────────────────────────────
 
-# Exact comm names that are always system/desktop — never show these
 SYSTEM_COMMS = frozenset([
     "systemd", "(sd-pam)", "dbus-daemon", "dbus-run-session",
     "NetworkManager", "wpa_supplicant", "dhcpcd", "dhclient",
@@ -131,7 +136,6 @@ SYSTEM_COMMS = frozenset([
     "bash", "zsh", "sh", "fish", "dash",
 ])
 
-# Substrings in args that mark a process as system — skip it
 SYSTEM_ARG_FRAGMENTS = [
     "/usr/lib/systemd/", "/lib/systemd/",
     "cosmic-ext-applet", "cosmic-files-applet",
@@ -140,10 +144,9 @@ SYSTEM_ARG_FRAGMENTS = [
     "evolution-",
     "goa-daemon",
     "tracker-",
-    "killer",      # our own script
+    "killer",
 ]
 
-# Keywords for auto-categorising discovered apps
 AUTO_CAT = {
     "Browsers":      ["chrome", "firefox", "brave", "opera", "vivaldi", "chromium", "epiphany", "midori"],
     "Communication": ["discord", "telegram", "zoom", "teams", "thunderbird", "bluemail", "slack",
@@ -166,7 +169,6 @@ def auto_categorize(comm, args):
 
 
 def scan_unknown_running(known_matches):
-    """Discover all user processes not covered by the APPS list."""
     r = subprocess.run(
         ["ps", "-u", getpass.getuser(), "-eo", "pid,rss,comm,args", "--no-headers"],
         capture_output=True, text=True,
@@ -182,13 +184,13 @@ def scan_unknown_running(known_matches):
             continue
         args = parts[3] if len(parts) > 3 else comm
 
-        if args.startswith("["):                                    # kernel thread
+        if args.startswith("["):
             continue
-        if comm in SYSTEM_COMMS:                                    # known system comm
+        if comm in SYSTEM_COMMS:
             continue
-        if any(f in args for f in SYSTEM_ARG_FRAGMENTS):           # system arg pattern
+        if any(f in args for f in SYSTEM_ARG_FRAGMENTS):
             continue
-        if any(m in args for m in known_matches):                   # already in APPS
+        if any(m in args for m in known_matches):
             continue
 
         if comm not in groups:
@@ -228,6 +230,23 @@ def get_ram_mb(app):
             except (ValueError, IndexError):
                 pass
     return total // 1024
+
+def get_all_cpu_pct():
+    """Single ps call → {args_line: cumulative_cpu_pct}."""
+    r = subprocess.run(["ps", "-eo", "pcpu,args", "--no-headers"],
+                       capture_output=True, text=True)
+    data = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            cpu = float(parts[0])
+        except ValueError:
+            continue
+        args = parts[1]
+        data[args] = data.get(args, 0.0) + cpu
+    return data
 
 def kill_app(app):
     subprocess.run(app["kill"], capture_output=True)
@@ -277,13 +296,9 @@ P_MSGOK   = 10
 P_MSGERR  = 11
 P_BAR     = 12
 P_SEARCH  = 13
+P_IDLE    = 14   # yellow text — idle (running but low CPU)
 
 # ── Column layout (0-indexed) ─────────────────────────────────
-#  0  indicator+number  (8 chars)
-#  8  name              (21 chars)
-# 30  status            (8 chars)
-# 39  ram               (9 chars)
-# 49  bar               (12 chars)
 COL_NUM  = 0
 COL_NAME = 8
 COL_STAT = 30
@@ -314,6 +329,11 @@ class KillerUI:
         self.num_buf   = ""
         self.search    = ""
         self.searching = False
+        # Idle tracking: app name → consecutive low-CPU reading count
+        self.app_idle: dict = {}
+        # RAM watchdog
+        self.watchdog = True
+        self._stop    = threading.Event()
         self._init()
 
     def _init(self):
@@ -332,6 +352,7 @@ class KillerUI:
         curses.init_pair(P_MSGERR,  curses.COLOR_WHITE,  curses.COLOR_RED)
         curses.init_pair(P_BAR,     curses.COLOR_GREEN,  -1)
         curses.init_pair(P_SEARCH,  curses.COLOR_BLACK,  curses.COLOR_YELLOW)
+        curses.init_pair(P_IDLE,    curses.COLOR_YELLOW, -1)
         curses.curs_set(0)
         curses.noecho()
         curses.cbreak()
@@ -341,11 +362,28 @@ class KillerUI:
     # ── State ─────────────────────────────────────────────────
 
     def refresh(self):
+        cpu_data = get_all_cpu_pct()
+
         known_state   = [(a, is_running(a), get_ram_mb(a)) for a in APPS]
         known_matches = [a["match"] for a in APPS]
         dynamic_apps  = scan_unknown_running(known_matches)
         dynamic_state = [(a, True, a["_ram_mb"]) for a in dynamic_apps]
         self.state    = known_state + dynamic_state
+
+        # Update idle counters — services are never considered idle
+        for app, running, _ in self.state:
+            name = app["name"]
+            if not running or app.get("service"):
+                self.app_idle.pop(name, None)
+                continue
+            cpu = sum(v for args, v in cpu_data.items() if app["match"] in args)
+            if cpu < IDLE_CPU_THRESHOLD:
+                self.app_idle[name] = self.app_idle.get(name, 0) + 1
+            else:
+                self.app_idle.pop(name, None)
+
+    def is_idle(self, app_name):
+        return self.app_idle.get(app_name, 0) >= IDLE_READINGS
 
     def tab_apps(self):
         if self.searching and self.search:
@@ -358,8 +396,11 @@ class KillerUI:
             cat = CATEGORIES[self.tab]
             apps = self.state if cat == "All" else \
                    [(a, r, m) for a, r, m in self.state if a["cat"] == cat]
-        # running apps first, then by RAM highest → lowest, stopped apps last
-        return sorted(apps, key=lambda x: (not x[1], -x[2]))
+        # running non-idle first, then idle running, stopped last — all by RAM desc
+        return sorted(apps, key=lambda x: (
+            0 if not x[1] else (2 if self.is_idle(x[0]["name"]) else 1),
+            -x[2]
+        ))
 
     def clamp_sel(self):
         n = len(self.tab_apps())
@@ -367,6 +408,34 @@ class KillerUI:
 
     def notify(self, text, ok=True):
         self.msg, self.msg_ok, self.msg_ts = text, ok, time.time()
+
+    # ── Watchdog thread ───────────────────────────────────────
+
+    def _watchdog_loop(self):
+        """Background thread: auto-kill highest-RAM idle (then any) app at 95% RAM."""
+        while not self._stop.wait(8):
+            if not self.watchdog:
+                continue
+            _, _, pct = get_ram_info()
+            if pct < RAM_WATCHDOG_PCT:
+                continue
+
+            running = [(a, r, m) for a, r, m in self.state if r and m > 0]
+            if not running:
+                continue
+
+            # Prefer idle apps; fall back to highest RAM overall
+            idle_running = [(a, r, m) for a, r, m in running if self.is_idle(a["name"])]
+            candidates   = idle_running if idle_running else running
+            top_app, _, top_mb = max(candidates, key=lambda x: x[2])
+
+            kill_app(top_app)
+            self.refresh()
+            tag = "IDLE" if idle_running else "TOP"
+            self.notify(
+                f" AUTO-KILL [{tag}]: {top_app['name']} ({top_mb} MB) — RAM was {pct}%",
+                ok=False,
+            )
 
     # ── Drawing ───────────────────────────────────────────────
 
@@ -404,10 +473,23 @@ class KillerUI:
 
     def _draw_title(self, w, total, avail, pct):
         self.fill(0, curses.color_pair(P_TITLE))
-        self.put(0, 0, " KILLER", curses.color_pair(P_TITLE) | curses.A_BOLD)
-        rc = curses.color_pair(P_OFF) if pct > 80 else (curses.color_pair(P_WARN) if pct > 60 else curses.color_pair(P_ON))
+        title_attr = curses.color_pair(P_TITLE) | curses.A_BOLD
+        self.put(0, 0, " KILLER", title_attr)
+
+        # Watchdog badge [W] — color shifts as RAM climbs toward threshold
+        if self.watchdog:
+            if pct >= RAM_WATCHDOG_PCT:
+                badge_attr = curses.color_pair(P_MSGERR) | curses.A_BOLD
+            elif pct >= RAM_WATCHDOG_PCT - 5:
+                badge_attr = curses.color_pair(P_WARN) | curses.A_BOLD
+            else:
+                badge_attr = curses.color_pair(P_ON) | curses.A_BOLD
+            self.put(0, 8, "[W]", badge_attr)
+        else:
+            self.put(0, 8, "[W]", curses.A_DIM)
+
         label = f"RAM {pct}%  {avail} MB free / {total} MB "
-        self.put(0, max(8, w - len(label)), label, curses.color_pair(P_TITLE) | curses.A_BOLD)
+        self.put(0, max(12, w - len(label)), label, title_attr)
 
     def _draw_tabs(self, w):
         self.fill(1, curses.color_pair(P_TAB_OFF))
@@ -448,6 +530,7 @@ class KillerUI:
             abs_i = i + self.scroll
             y = top + i
             sel = abs_i == self.sel
+            idle = running and self.is_idle(app["name"])
 
             if sel:
                 self.fill(y, curses.color_pair(P_SEL))
@@ -455,10 +538,8 @@ class KillerUI:
             base = curses.color_pair(P_SEL) if sel else 0
             ind  = "▶" if sel else " "
 
-            # indicator + number
             self.put(y, COL_NUM, f"  {ind} {abs_i + 1:<3}", base | curses.A_BOLD)
 
-            # name  (~prefix for auto-detected; category badge when searching)
             prefix = "~" if app.get("dynamic") else " "
             raw    = prefix + app["name"]
             if self.searching and self.search:
@@ -467,25 +548,33 @@ class KillerUI:
             name = f"{raw:<21}"
             self.put(y, COL_NAME, name, base)
 
-            # status (colored unless selected)
+            # Status: ON / IDLE / OFF
             if running:
-                st_attr = curses.color_pair(P_SEL) if sel else (curses.color_pair(P_ON) | curses.A_BOLD)
-                self.put(y, COL_STAT, f"{'ON':<8}", st_attr)
+                if idle and not sel:
+                    self.put(y, COL_STAT, f"{'IDLE':<8}",
+                             curses.color_pair(P_IDLE) | curses.A_BOLD)
+                else:
+                    st_attr = curses.color_pair(P_SEL) if sel else (curses.color_pair(P_ON) | curses.A_BOLD)
+                    self.put(y, COL_STAT, f"{'ON':<8}", st_attr)
             else:
                 st_attr = curses.color_pair(P_SEL) if sel else (curses.color_pair(P_OFF) | curses.A_BOLD)
                 self.put(y, COL_STAT, f"{'OFF':<8}", st_attr)
 
-            # RAM
             self.put(y, COL_RAM, f"{ram_str(running, mb):>9}", base)
 
-            # bar
             bar = ram_bar(running, mb)
-            bar_attr = curses.color_pair(P_SEL) if sel else (curses.color_pair(P_BAR) if running else curses.A_DIM)
+            if sel:
+                bar_attr = curses.color_pair(P_SEL)
+            elif idle:
+                bar_attr = curses.color_pair(P_IDLE)
+            elif running:
+                bar_attr = curses.color_pair(P_BAR)
+            else:
+                bar_attr = curses.A_DIM
             self.put(y, COL_BAR, f"  {bar}", bar_attr)
 
     def _draw_footer(self, sep_y, hint_y, w):
         if self.searching:
-            # ── Search bar (replaces separator) ───────────────
             sa = curses.color_pair(P_SEARCH) | curses.A_BOLD
             self.fill(sep_y, curses.color_pair(P_SEARCH))
             prompt = f"  Search: {self.search}"
@@ -503,12 +592,14 @@ class KillerUI:
             self.put(sep_y, 0, "─" * w, curses.color_pair(P_HDR))
 
         self.fill(hint_y, curses.color_pair(P_HINT))
+        w_state = "ON" if self.watchdog else "OFF"
         if self.searching:
             hint = "  ↑↓ navigate   Enter/Spc toggle   Esc cancel search"
         elif self.num_buf:
             hint = f" Jump to #: {self.num_buf}_   (Enter to toggle, Esc to cancel)"
         else:
-            hint = " / search   ↑↓ nav   enter/spc toggle   ←→/tab switch   a stop-all   c cache   X RESET   q quit "
+            hint = (f" / search  ↑↓ nav  enter toggle  ←→/tab switch"
+                    f"  a stop-all  c cache  w watchdog:{w_state}  X RESET  q quit ")
         self.put(hint_y, 0, hint[:w], curses.color_pair(P_HINT) | curses.A_BOLD)
 
     def _toggle(self, entry):
@@ -534,30 +625,26 @@ class KillerUI:
         dy, dx = max(0, (h - dh) // 2), max(0, (w - dw) // 2)
         buf = ""
 
-        danger = curses.color_pair(P_MSGERR) | curses.A_BOLD
+        danger     = curses.color_pair(P_MSGERR) | curses.A_BOLD
         danger_dim = curses.color_pair(P_MSGERR)
 
         while True:
-            # Fill dialog background
             for y in range(dh):
                 try:
                     self.scr.addstr(dy + y, dx, " " * dw, curses.color_pair(P_MSGERR))
                 except curses.error:
                     pass
 
-            # Border
             self.put(dy,          dx, "╔" + "═" * (dw - 2) + "╗", danger)
             self.put(dy + dh - 1, dx, "╚" + "═" * (dw - 2) + "╝", danger)
             for y in range(1, dh - 1):
                 self.put(dy + y, dx,          "║", danger)
                 self.put(dy + y, dx + dw - 1, "║", danger)
 
-            # Title
             title = "  ⚠  FULL RESET  ⚠  "
             self.put(dy + 1, dx + (dw - len(title)) // 2, title, danger)
             self.put(dy + 2, dx + 1, "═" * (dw - 2), danger)
 
-            # Body
             lines = [
                 "",
                 "  This will kill ALL non-system processes:",
@@ -599,7 +686,6 @@ class KillerUI:
             "notification", "portal",
         ]
 
-        # Walk up to find ancestor PIDs (our terminal chain — never kill these)
         ancestors = set()
         pid = os.getpid()
         while pid > 1:
@@ -617,19 +703,16 @@ class KillerUI:
 
         my_pid = os.getpid()
 
-        # 1. Stop all services gracefully
         for app in APPS:
             if app.get("service"):
                 subprocess.run(app["kill"], capture_output=True)
 
-        # 2. Kill all known app processes
         for app in APPS:
             if not app.get("service"):
                 subprocess.run(app["kill"], capture_output=True)
 
         time.sleep(0.5)
 
-        # 3. Kill remaining user processes not in whitelist
         user = getpass.getuser()
         r = subprocess.run(
             ["ps", "-u", user, "-o", "pid,args", "--no-headers"],
@@ -650,7 +733,6 @@ class KillerUI:
             if not any(p.lower() in args for p in KEEP):
                 to_kill.append(pid)
 
-        # SIGTERM first, then SIGKILL stragglers
         for pid in to_kill:
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -663,7 +745,6 @@ class KillerUI:
             except OSError:
                 pass
 
-        # 4. Drop cache + reclaim swap
         drop_cache()
 
     # ── Input loop ────────────────────────────────────────────
@@ -672,146 +753,157 @@ class KillerUI:
         self.refresh()
         last_ref = time.time()
 
-        while True:
-            self.draw()
-            k = self.scr.getch()
+        wt = threading.Thread(target=self._watchdog_loop, daemon=True)
+        wt.start()
 
-            if time.time() - last_ref > 4:
-                self.refresh()
-                last_ref = time.time()
+        try:
+            while True:
+                self.draw()
+                k = self.scr.getch()
 
-            if k == -1:
-                self.refresh()
-                last_ref = time.time()
-                continue
+                if time.time() - last_ref > 4:
+                    self.refresh()
+                    last_ref = time.time()
 
-            apps = self.tab_apps()
+                if k == -1:
+                    self.refresh()
+                    last_ref = time.time()
+                    continue
 
-            # ── Search mode intercepts most keys ──────────────
-            if self.searching:
-                if k == 27:                              # Esc → exit search
-                    self.searching = False
+                apps = self.tab_apps()
+
+                # ── Search mode ───────────────────────────────
+                if self.searching:
+                    if k == 27:
+                        self.searching = False
+                        self.search    = ""
+                        self.sel       = 0
+                        self.scroll    = 0
+                    elif k in (curses.KEY_BACKSPACE, 127):
+                        self.search = self.search[:-1]
+                        self.sel    = 0
+                        self.scroll = 0
+                    elif k == curses.KEY_UP:
+                        if self.sel > 0:
+                            self.sel -= 1
+                    elif k == curses.KEY_DOWN:
+                        if self.sel < len(apps) - 1:
+                            self.sel += 1
+                    elif k in (curses.KEY_ENTER, ord('\n'), ord('\r'), ord(' ')):
+                        if apps:
+                            self._toggle(apps[self.sel])
+                            self.refresh()
+                            last_ref = time.time()
+                    elif 32 <= k <= 126:
+                        self.search += chr(k)
+                        self.sel    = 0
+                        self.scroll = 0
+                    continue
+
+                # ── Normal mode ───────────────────────────────
+                if k == ord('/'):
+                    self.searching = True
                     self.search    = ""
+                    self.num_buf   = ""
                     self.sel       = 0
                     self.scroll    = 0
-                elif k in (curses.KEY_BACKSPACE, 127):
-                    self.search = self.search[:-1]
-                    self.sel    = 0
+
+                elif k in (ord('q'), ord('Q')):
+                    break
+
+                elif k in (ord('r'), ord('R')):
+                    self.refresh()
+                    last_ref = time.time()
+                    self.notify(" Refreshed")
+
+                elif k in (ord('w'), ord('W')):
+                    self.watchdog = not self.watchdog
+                    state = "enabled" if self.watchdog else "disabled"
+                    self.notify(f" RAM watchdog {state} (auto-kill at {RAM_WATCHDOG_PCT}%)")
+
+                elif k in (curses.KEY_RIGHT, ord('\t'), 9):
+                    self.num_buf = ""
+                    self.tab = (self.tab + 1) % len(CATEGORIES)
                     self.scroll = 0
+                    self.clamp_sel()
+
+                elif k == curses.KEY_LEFT:
+                    self.num_buf = ""
+                    self.tab = (self.tab - 1) % len(CATEGORIES)
+                    self.scroll = 0
+                    self.clamp_sel()
+
                 elif k == curses.KEY_UP:
+                    self.num_buf = ""
                     if self.sel > 0:
                         self.sel -= 1
+
                 elif k == curses.KEY_DOWN:
+                    self.num_buf = ""
                     if self.sel < len(apps) - 1:
                         self.sel += 1
+
+                elif k == 27:
+                    self.num_buf = ""
+
+                elif k in (curses.KEY_BACKSPACE, 127):
+                    self.num_buf = self.num_buf[:-1]
+
                 elif k in (curses.KEY_ENTER, ord('\n'), ord('\r'), ord(' ')):
-                    if apps:
+                    if self.num_buf:
+                        idx = int(self.num_buf) - 1
+                        self.num_buf = ""
+                        if 0 <= idx < len(apps):
+                            self.sel = idx
+                            self._toggle(apps[idx])
+                            self.refresh()
+                            last_ref = time.time()
+                        else:
+                            self.notify(f" No app #{idx + 1} in this tab", ok=False)
+                    elif apps:
                         self._toggle(apps[self.sel])
                         self.refresh()
                         last_ref = time.time()
-                elif 32 <= k <= 126:
-                    self.search += chr(k)
-                    self.sel    = 0
-                    self.scroll = 0
-                continue
 
-            # ── Normal mode ───────────────────────────────────
-            if k == ord('/'):
-                self.searching = True
-                self.search    = ""
-                self.num_buf   = ""
-                self.sel       = 0
-                self.scroll    = 0
-
-            elif k in (ord('q'), ord('Q')):
-                break
-
-            elif k in (ord('r'), ord('R')):
-                self.refresh()
-                last_ref = time.time()
-                self.notify(" Refreshed")
-
-            elif k in (curses.KEY_RIGHT, ord('\t'), 9):
-                self.num_buf = ""
-                self.tab = (self.tab + 1) % len(CATEGORIES)
-                self.scroll = 0
-                self.clamp_sel()
-
-            elif k == curses.KEY_LEFT:
-                self.num_buf = ""
-                self.tab = (self.tab - 1) % len(CATEGORIES)
-                self.scroll = 0
-                self.clamp_sel()
-
-            elif k == curses.KEY_UP:
-                self.num_buf = ""
-                if self.sel > 0:
-                    self.sel -= 1
-
-            elif k == curses.KEY_DOWN:
-                self.num_buf = ""
-                if self.sel < len(apps) - 1:
-                    self.sel += 1
-
-            elif k == 27:  # Escape
-                self.num_buf = ""
-
-            elif k in (curses.KEY_BACKSPACE, 127):
-                self.num_buf = self.num_buf[:-1]
-
-            elif k in (curses.KEY_ENTER, ord('\n'), ord('\r'), ord(' ')):
-                if self.num_buf:
-                    idx = int(self.num_buf) - 1
-                    self.num_buf = ""
-                    if 0 <= idx < len(apps):
-                        self.sel = idx
-                        self._toggle(apps[idx])
+                elif k in (ord('a'), ord('A')):
+                    to_stop = [(a, r, m) for a, r, m in apps if r]
+                    if to_stop:
+                        self.notify(f" Stopping {len(to_stop)} apps in this tab...")
+                        self.draw()
+                        for a, _, _ in to_stop:
+                            kill_app(a)
+                        time.sleep(1)
                         self.refresh()
                         last_ref = time.time()
+                        self.notify(f" Stopped {len(to_stop)} apps")
                     else:
-                        self.notify(f" No app #{idx + 1} in this tab", ok=False)
-                elif apps:
-                    self._toggle(apps[self.sel])
-                    self.refresh()
-                    last_ref = time.time()
+                        self.notify(" No running apps in this tab", ok=False)
 
-            elif k in (ord('a'), ord('A')):
-                to_stop = [(a, r, m) for a, r, m in apps if r]
-                if to_stop:
-                    self.notify(f" Stopping {len(to_stop)} apps in this tab...")
+                elif k in (ord('c'), ord('C')):
+                    self.notify(" Dropping cache + reclaiming swap...")
                     self.draw()
-                    for a, _, _ in to_stop:
-                        kill_app(a)
-                    time.sleep(1)
+                    drop_cache()
                     self.refresh()
                     last_ref = time.time()
-                    self.notify(f" Stopped {len(to_stop)} apps")
-                else:
-                    self.notify(" No running apps in this tab", ok=False)
+                    self.notify(" Cache cleared and swap reclaimed!")
 
-            elif k in (ord('c'), ord('C')):
-                self.notify(" Dropping cache + reclaiming swap...")
-                self.draw()
-                drop_cache()
-                self.refresh()
-                last_ref = time.time()
-                self.notify(" Cache cleared and swap reclaimed!")
+                elif k == ord('X'):
+                    if self._confirm_reset():
+                        self.notify(" Running full reset...")
+                        self.draw()
+                        self._do_full_reset()
+                        self.refresh()
+                        last_ref = time.time()
+                        self.notify(" Full reset complete — only COSMIC remains")
 
-            elif k == ord('X'):
-                if self._confirm_reset():
-                    self.notify(" Running full reset...")
-                    self.draw()
-                    self._do_full_reset()
-                    self.refresh()
-                    last_ref = time.time()
-                    self.notify(" Full reset complete — only COSMIC remains")
+                elif ord('0') <= k <= ord('9'):
+                    self.num_buf += chr(k)
+                    idx = int(self.num_buf) - 1
+                    if 0 <= idx < len(apps):
+                        self.sel = idx
 
-            elif ord('0') <= k <= ord('9'):
-                self.num_buf += chr(k)
-                # auto-jump selection to give visual feedback
-                idx = int(self.num_buf) - 1
-                if 0 <= idx < len(apps):
-                    self.sel = idx
+        finally:
+            self._stop.set()
 
 
 def main(scr):
