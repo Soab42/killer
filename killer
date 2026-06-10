@@ -9,6 +9,8 @@ RAM_WATCHDOG_PCT = 95
 IDLE_CPU_THRESHOLD = 1.0   # percent
 IDLE_READINGS      = 2
 
+SORT_MODES = ["RAM↓", "RAM↑", "Name", "Active"]
+
 APPS = [
     # Browsers
     {"name": "Chrome",          "cat": "Browsers",
@@ -331,9 +333,12 @@ class KillerUI:
         self.searching = False
         # Idle tracking: app name → consecutive low-CPU reading count
         self.app_idle: dict = {}
+        # Sort
+        self.sort_mode = 0          # index into SORT_MODES; default RAM↓
         # RAM watchdog
-        self.watchdog = True
-        self._stop    = threading.Event()
+        self.watchdog   = True      # auto-kill at RAM_WATCHDOG_PCT
+        self.idle_kill  = True      # prefer idle apps when auto-killing
+        self._stop      = threading.Event()
         self._init()
 
     def _init(self):
@@ -396,11 +401,20 @@ class KillerUI:
             cat = CATEGORIES[self.tab]
             apps = self.state if cat == "All" else \
                    [(a, r, m) for a, r, m in self.state if a["cat"] == cat]
-        # running non-idle first, then idle running, stopped last — all by RAM desc
-        return sorted(apps, key=lambda x: (
-            0 if not x[1] else (2 if self.is_idle(x[0]["name"]) else 1),
-            -x[2]
-        ))
+
+        mode = SORT_MODES[self.sort_mode]
+        if mode == "RAM↓":
+            # Highest RAM first; stopped apps (0 MB) fall naturally to the bottom
+            return sorted(apps, key=lambda x: -x[2])
+        elif mode == "RAM↑":
+            return sorted(apps, key=lambda x: x[2])
+        elif mode == "Name":
+            return sorted(apps, key=lambda x: x[0]["name"].lower())
+        else:  # "Active" — running → idle → stopped, RAM desc within each group
+            return sorted(apps, key=lambda x: (
+                2 if not x[1] else (1 if self.is_idle(x[0]["name"]) else 0),
+                -x[2]
+            ))
 
     def clamp_sel(self):
         n = len(self.tab_apps())
@@ -424,14 +438,17 @@ class KillerUI:
             if not running:
                 continue
 
-            # Prefer idle apps; fall back to highest RAM overall
-            idle_running = [(a, r, m) for a, r, m in running if self.is_idle(a["name"])]
-            candidates   = idle_running if idle_running else running
-            top_app, _, top_mb = max(candidates, key=lambda x: x[2])
+            if self.idle_kill:
+                idle_running = [(a, r, m) for a, r, m in running if self.is_idle(a["name"])]
+                candidates   = idle_running if idle_running else running
+                tag          = "IDLE" if idle_running else "TOP"
+            else:
+                candidates = running
+                tag        = "TOP"
 
+            top_app, _, top_mb = max(candidates, key=lambda x: x[2])
             kill_app(top_app)
             self.refresh()
-            tag = "IDLE" if idle_running else "TOP"
             self.notify(
                 f" AUTO-KILL [{tag}]: {top_app['name']} ({top_mb} MB) — RAM was {pct}%",
                 ok=False,
@@ -476,20 +493,24 @@ class KillerUI:
         title_attr = curses.color_pair(P_TITLE) | curses.A_BOLD
         self.put(0, 0, " KILLER", title_attr)
 
-        # Watchdog badge [W] — color shifts as RAM climbs toward threshold
+        # [W] watchdog badge — color shifts as RAM climbs toward threshold
         if self.watchdog:
             if pct >= RAM_WATCHDOG_PCT:
-                badge_attr = curses.color_pair(P_MSGERR) | curses.A_BOLD
+                w_attr = curses.color_pair(P_MSGERR) | curses.A_BOLD
             elif pct >= RAM_WATCHDOG_PCT - 5:
-                badge_attr = curses.color_pair(P_WARN) | curses.A_BOLD
+                w_attr = curses.color_pair(P_WARN) | curses.A_BOLD
             else:
-                badge_attr = curses.color_pair(P_ON) | curses.A_BOLD
-            self.put(0, 8, "[W]", badge_attr)
+                w_attr = curses.color_pair(P_ON) | curses.A_BOLD
         else:
-            self.put(0, 8, "[W]", curses.A_DIM)
+            w_attr = curses.A_DIM
+        self.put(0, 8, "[W]", w_attr)
+
+        # [I] idle auto-kill badge
+        i_attr = (curses.color_pair(P_IDLE) | curses.A_BOLD) if self.idle_kill else curses.A_DIM
+        self.put(0, 12, "[I]", i_attr)
 
         label = f"RAM {pct}%  {avail} MB free / {total} MB "
-        self.put(0, max(12, w - len(label)), label, title_attr)
+        self.put(0, max(16, w - len(label)), label, title_attr)
 
     def _draw_tabs(self, w):
         self.fill(1, curses.color_pair(P_TAB_OFF))
@@ -514,6 +535,8 @@ class KillerUI:
         self.put(2, COL_STAT, f"{'Status':<8}", hdr_attr)
         self.put(2, COL_RAM,  f"{'RAM':>9}",    hdr_attr)
         self.put(2, COL_BAR,  "  Usage",         hdr_attr)
+        sort_label = f"[s:{SORT_MODES[self.sort_mode]}] "
+        self.put(2, max(COL_BAR + 8, w - len(sort_label) - 1), sort_label, hdr_attr)
 
     def _draw_list(self, top, rows, w):
         apps = self.tab_apps()
@@ -593,13 +616,16 @@ class KillerUI:
 
         self.fill(hint_y, curses.color_pair(P_HINT))
         w_state = "ON" if self.watchdog else "OFF"
+        i_state = "ON" if self.idle_kill  else "OFF"
         if self.searching:
             hint = "  ↑↓ navigate   Enter/Spc toggle   Esc cancel search"
         elif self.num_buf:
             hint = f" Jump to #: {self.num_buf}_   (Enter to toggle, Esc to cancel)"
         else:
-            hint = (f" / search  ↑↓ nav  enter toggle  ←→/tab switch"
-                    f"  a stop-all  c cache  w watchdog:{w_state}  X RESET  q quit ")
+            hint = (f" / search  ↑↓ nav  enter toggle  ←→/tab"
+                    f"  s sort:{SORT_MODES[self.sort_mode]}"
+                    f"  i idle:{i_state}  w watch:{w_state}"
+                    f"  a stop-all  c cache  X RESET  q quit ")
         self.put(hint_y, 0, hint[:w], curses.color_pair(P_HINT) | curses.A_BOLD)
 
     def _toggle(self, entry):
@@ -818,8 +844,20 @@ class KillerUI:
 
                 elif k in (ord('w'), ord('W')):
                     self.watchdog = not self.watchdog
-                    state = "enabled" if self.watchdog else "disabled"
-                    self.notify(f" RAM watchdog {state} (auto-kill at {RAM_WATCHDOG_PCT}%)")
+                    state = "ON" if self.watchdog else "OFF"
+                    self.notify(f" RAM watchdog {state} — auto-kill at {RAM_WATCHDOG_PCT}%")
+
+                elif k in (ord('s'), ord('S')):
+                    self.sort_mode = (self.sort_mode + 1) % len(SORT_MODES)
+                    self.sel    = 0
+                    self.scroll = 0
+                    self.notify(f" Sort: {SORT_MODES[self.sort_mode]}")
+
+                elif k in (ord('i'), ord('I')):
+                    self.idle_kill = not self.idle_kill
+                    state = "ON" if self.idle_kill else "OFF"
+                    detail = "kills idle apps first" if self.idle_kill else "kills highest RAM only"
+                    self.notify(f" Idle auto-close {state} — watchdog {detail}")
 
                 elif k in (curses.KEY_RIGHT, ord('\t'), 9):
                     self.num_buf = ""
