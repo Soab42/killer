@@ -276,6 +276,7 @@ P_WARN    = 9
 P_MSGOK   = 10
 P_MSGERR  = 11
 P_BAR     = 12
+P_SEARCH  = 13
 
 # ── Column layout (0-indexed) ─────────────────────────────────
 #  0  indicator+number  (8 chars)
@@ -310,8 +311,9 @@ class KillerUI:
         self.msg     = ""
         self.msg_ok  = True
         self.msg_ts  = 0
-        self.num_buf = ""
-        self.search  = ""
+        self.num_buf   = ""
+        self.search    = ""
+        self.searching = False
         self._init()
 
     def _init(self):
@@ -329,6 +331,7 @@ class KillerUI:
         curses.init_pair(P_MSGOK,   curses.COLOR_BLACK,  curses.COLOR_GREEN)
         curses.init_pair(P_MSGERR,  curses.COLOR_WHITE,  curses.COLOR_RED)
         curses.init_pair(P_BAR,     curses.COLOR_GREEN,  -1)
+        curses.init_pair(P_SEARCH,  curses.COLOR_BLACK,  curses.COLOR_YELLOW)
         curses.curs_set(0)
         curses.noecho()
         curses.cbreak()
@@ -345,10 +348,12 @@ class KillerUI:
         self.state    = known_state + dynamic_state
 
     def tab_apps(self):
-        if self.search:
+        if self.searching and self.search:
             q = self.search.lower()
             return [(a, r, m) for a, r, m in self.state
                     if q in a["name"].lower() or q in a.get("cat", "").lower()]
+        if self.searching:          # active but empty query → show all
+            return self.state
         cat = CATEGORIES[self.tab]
         if cat == "All":
             return self.state
@@ -454,7 +459,7 @@ class KillerUI:
             # name  (~prefix for auto-detected; category badge when searching)
             prefix = "~" if app.get("dynamic") else " "
             raw    = prefix + app["name"]
-            if self.search:
+            if self.searching and self.search:
                 badge = f" [{app.get('cat','?')[:4]}]"
                 raw   = raw[:21 - len(badge)] + badge
             name = f"{raw:<21}"
@@ -477,7 +482,18 @@ class KillerUI:
             self.put(y, COL_BAR, f"  {bar}", bar_attr)
 
     def _draw_footer(self, sep_y, hint_y, w):
-        if self.msg and time.time() - self.msg_ts < 3:
+        if self.searching:
+            # ── Search bar (replaces separator) ───────────────
+            sa = curses.color_pair(P_SEARCH) | curses.A_BOLD
+            self.fill(sep_y, curses.color_pair(P_SEARCH))
+            prompt = f"  Search: {self.search}"
+            cursor = "_"
+            n_results = len(self.tab_apps())
+            count = f"  {n_results} result{'s' if n_results != 1 else ''}  "
+            self.put(sep_y, 0, prompt, sa)
+            self.put(sep_y, len(prompt), cursor, sa | curses.A_BLINK)
+            self.put(sep_y, max(len(prompt) + 1, w - len(count)), count, sa)
+        elif self.msg and time.time() - self.msg_ts < 3:
             attr = curses.color_pair(P_MSGOK) if self.msg_ok else curses.color_pair(P_MSGERR)
             self.fill(sep_y, attr)
             self.put(sep_y, 1, self.msg[:w - 2], attr | curses.A_BOLD)
@@ -485,8 +501,8 @@ class KillerUI:
             self.put(sep_y, 0, "─" * w, curses.color_pair(P_HDR))
 
         self.fill(hint_y, curses.color_pair(P_HINT))
-        if self.search:
-            hint = f" / {self.search}_   ↑↓ navigate   enter toggle   Esc clear search"
+        if self.searching:
+            hint = "  ↑↓ navigate   Enter/Spc toggle   Esc cancel search"
         elif self.num_buf:
             hint = f" Jump to #: {self.num_buf}_   (Enter to toggle, Esc to cancel)"
         else:
@@ -670,14 +686,15 @@ class KillerUI:
             apps = self.tab_apps()
 
             # ── Search mode intercepts most keys ──────────────
-            if self.search:
-                if k == 27:                              # Esc → clear search
-                    self.search = ""
-                    self.sel = 0
-                    self.scroll = 0
+            if self.searching:
+                if k == 27:                              # Esc → exit search
+                    self.searching = False
+                    self.search    = ""
+                    self.sel       = 0
+                    self.scroll    = 0
                 elif k in (curses.KEY_BACKSPACE, 127):
                     self.search = self.search[:-1]
-                    self.sel = 0
+                    self.sel    = 0
                     self.scroll = 0
                 elif k == curses.KEY_UP:
                     if self.sel > 0:
@@ -690,18 +707,19 @@ class KillerUI:
                         self._toggle(apps[self.sel])
                         self.refresh()
                         last_ref = time.time()
-                elif 32 <= k <= 126 and chr(k) not in '\t':
+                elif 32 <= k <= 126:
                     self.search += chr(k)
-                    self.sel = 0
+                    self.sel    = 0
                     self.scroll = 0
                 continue
 
             # ── Normal mode ───────────────────────────────────
             if k == ord('/'):
-                self.search = ""
-                self.num_buf = ""
-                self.sel = 0
-                self.scroll = 0
+                self.searching = True
+                self.search    = ""
+                self.num_buf   = ""
+                self.sel       = 0
+                self.scroll    = 0
 
             elif k in (ord('q'), ord('Q')):
                 break
