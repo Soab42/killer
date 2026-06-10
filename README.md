@@ -60,17 +60,24 @@ killer
 
 | Key | Action |
 |-----|--------|
+| `/` | Open search — type to filter across all apps |
+| `Esc` | Clear search / cancel number input |
 | `↑` / `↓` | Navigate the app list |
 | `Enter` / `Space` | Toggle selected app (start or stop) |
 | `←` / `→` or `Tab` | Switch category tab |
 | `1`–`9`, `10`, `11`... | Type a number then Enter to jump and toggle |
-| `Backspace` | Delete last digit while typing a number |
-| `Esc` | Cancel number input |
+| `Backspace` | Delete last search character or digit |
 | `a` | Stop all running apps in the current tab |
 | `c` | Drop page cache + reclaim swap (`sudo` required) |
 | `X` | **Full reset** — kills everything, leaves only the desktop |
 | `r` | Refresh now |
 | `q` | Quit |
+
+### Search
+
+Press `/` to enter search mode. Type any part of an app name or category.
+Results are filtered live across **all** categories. Each result shows a
+`[Cat]` badge so you know where it lives. Press `Enter` to toggle, `Esc` to clear.
 
 ## Tab Overview
 

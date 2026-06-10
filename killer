@@ -311,6 +311,7 @@ class KillerUI:
         self.msg_ok  = True
         self.msg_ts  = 0
         self.num_buf = ""
+        self.search  = ""
         self._init()
 
     def _init(self):
@@ -344,6 +345,10 @@ class KillerUI:
         self.state    = known_state + dynamic_state
 
     def tab_apps(self):
+        if self.search:
+            q = self.search.lower()
+            return [(a, r, m) for a, r, m in self.state
+                    if q in a["name"].lower() or q in a.get("cat", "").lower()]
         cat = CATEGORIES[self.tab]
         if cat == "All":
             return self.state
@@ -446,10 +451,14 @@ class KillerUI:
             # indicator + number
             self.put(y, COL_NUM, f"  {ind} {abs_i + 1:<3}", base | curses.A_BOLD)
 
-            # name  (~prefix for auto-detected apps with no start command)
+            # name  (~prefix for auto-detected; category badge when searching)
             prefix = "~" if app.get("dynamic") else " "
-            name   = (prefix + app["name"])[:21]
-            self.put(y, COL_NAME, f"{name:<21}", base)
+            raw    = prefix + app["name"]
+            if self.search:
+                badge = f" [{app.get('cat','?')[:4]}]"
+                raw   = raw[:21 - len(badge)] + badge
+            name = f"{raw:<21}"
+            self.put(y, COL_NAME, name, base)
 
             # status (colored unless selected)
             if running:
@@ -476,10 +485,12 @@ class KillerUI:
             self.put(sep_y, 0, "─" * w, curses.color_pair(P_HDR))
 
         self.fill(hint_y, curses.color_pair(P_HINT))
-        if self.num_buf:
+        if self.search:
+            hint = f" / {self.search}_   ↑↓ navigate   enter toggle   Esc clear search"
+        elif self.num_buf:
             hint = f" Jump to #: {self.num_buf}_   (Enter to toggle, Esc to cancel)"
         else:
-            hint = " ↑↓ nav   enter/spc toggle   ←→/tab switch   a stop-all   c drop-cache   X FULL RESET   q quit "
+            hint = " / search   ↑↓ nav   enter/spc toggle   ←→/tab switch   a stop-all   c cache   X RESET   q quit "
         self.put(hint_y, 0, hint[:w], curses.color_pair(P_HINT) | curses.A_BOLD)
 
     def _toggle(self, entry):
@@ -658,7 +669,41 @@ class KillerUI:
 
             apps = self.tab_apps()
 
-            if k in (ord('q'), ord('Q')):
+            # ── Search mode intercepts most keys ──────────────
+            if self.search:
+                if k == 27:                              # Esc → clear search
+                    self.search = ""
+                    self.sel = 0
+                    self.scroll = 0
+                elif k in (curses.KEY_BACKSPACE, 127):
+                    self.search = self.search[:-1]
+                    self.sel = 0
+                    self.scroll = 0
+                elif k == curses.KEY_UP:
+                    if self.sel > 0:
+                        self.sel -= 1
+                elif k == curses.KEY_DOWN:
+                    if self.sel < len(apps) - 1:
+                        self.sel += 1
+                elif k in (curses.KEY_ENTER, ord('\n'), ord('\r'), ord(' ')):
+                    if apps:
+                        self._toggle(apps[self.sel])
+                        self.refresh()
+                        last_ref = time.time()
+                elif 32 <= k <= 126 and chr(k) not in '\t':
+                    self.search += chr(k)
+                    self.sel = 0
+                    self.scroll = 0
+                continue
+
+            # ── Normal mode ───────────────────────────────────
+            if k == ord('/'):
+                self.search = ""
+                self.num_buf = ""
+                self.sel = 0
+                self.scroll = 0
+
+            elif k in (ord('q'), ord('Q')):
                 break
 
             elif k in (ord('r'), ord('R')):
