@@ -906,12 +906,89 @@ class KillerUI:
             self._stop.set()
 
 
+def run_daemon():
+    """Headless watchdog — no curses. Designed to run as a systemd user service."""
+    log_dir = os.path.expanduser("~/.local/share/killer")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "watchdog.log")
+
+    def log(msg):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {msg}"
+        print(line, flush=True)           # journald picks this up via stdout
+        with open(log_path, "a") as f:
+            f.write(line + "\n")
+
+    app_idle: dict = {}
+
+    def refresh_state():
+        cpu_data      = get_all_cpu_pct()
+        known_state   = [(a, is_running(a), get_ram_mb(a)) for a in APPS]
+        known_matches = [a["match"] for a in APPS]
+        dynamic_apps  = scan_unknown_running(known_matches)
+        dynamic_state = [(a, True, a["_ram_mb"]) for a in dynamic_apps]
+        state         = known_state + dynamic_state
+
+        for app, running, _ in state:
+            name = app["name"]
+            if not running or app.get("service"):
+                app_idle.pop(name, None)
+                continue
+            cpu = sum(v for args, v in cpu_data.items() if app["match"] in args)
+            if cpu < IDLE_CPU_THRESHOLD:
+                app_idle[name] = app_idle.get(name, 0) + 1
+            else:
+                app_idle.pop(name, None)
+        return state
+
+    def is_idle(name):
+        return app_idle.get(name, 0) >= IDLE_READINGS
+
+    # Graceful shutdown on SIGTERM
+    running_flag = [True]
+    def _stop(sig, frame):
+        running_flag[0] = False
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT,  _stop)
+
+    log(f"killer watchdog started — auto-kill threshold: {RAM_WATCHDOG_PCT}%  "
+        f"idle threshold: {IDLE_CPU_THRESHOLD}% CPU for {IDLE_READINGS} readings")
+
+    while running_flag[0]:
+        time.sleep(8)
+        if not running_flag[0]:
+            break
+
+        _, _, pct = get_ram_info()
+        state = refresh_state()
+
+        if pct < RAM_WATCHDOG_PCT:
+            continue
+
+        active = [(a, r, m) for a, r, m in state if r and m > 0]
+        if not active:
+            continue
+
+        idle_running = [(a, r, m) for a, r, m in active if is_idle(a["name"])]
+        candidates   = idle_running if idle_running else active
+        top_app, _, top_mb = max(candidates, key=lambda x: x[2])
+
+        tag = "IDLE" if idle_running else "TOP"
+        log(f"AUTO-KILL [{tag}]: {top_app['name']} ({top_mb} MB) — RAM {pct}%")
+        kill_app(top_app)
+
+    log("killer watchdog stopped")
+
+
 def main(scr):
     KillerUI(scr).run()
 
 
 if __name__ == "__main__":
-    if not sys.stdout.isatty():
+    if "--daemon" in sys.argv:
+        run_daemon()
+    elif not sys.stdout.isatty():
         print("killer: must be run in a terminal")
         sys.exit(1)
-    curses.wrapper(main)
+    else:
+        curses.wrapper(main)
