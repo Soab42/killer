@@ -350,14 +350,16 @@ class KillerUI:
     def tab_apps(self):
         if self.searching and self.search:
             q = self.search.lower()
-            return [(a, r, m) for a, r, m in self.state
+            apps = [(a, r, m) for a, r, m in self.state
                     if q in a["name"].lower() or q in a.get("cat", "").lower()]
-        if self.searching:          # active but empty query → show all
-            return self.state
-        cat = CATEGORIES[self.tab]
-        if cat == "All":
-            return self.state
-        return [(a, r, m) for a, r, m in self.state if a["cat"] == cat]
+        elif self.searching:
+            apps = list(self.state)
+        else:
+            cat = CATEGORIES[self.tab]
+            apps = self.state if cat == "All" else \
+                   [(a, r, m) for a, r, m in self.state if a["cat"] == cat]
+        # running apps first, then by RAM highest → lowest, stopped apps last
+        return sorted(apps, key=lambda x: (not x[1], -x[2]))
 
     def clamp_sel(self):
         n = len(self.tab_apps())
