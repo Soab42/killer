@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+import curses, subprocess, os, glob, time, sys, signal, getpass
+
+CATEGORIES = ["All", "Browsers", "Communication", "Dev", "Creative", "Servers", "Background", "Other"]
+
+APPS = [
+    # Browsers
+    {"name": "Chrome",          "cat": "Browsers",
+     "match": "/opt/google/chrome/chrome",
+     "kill": ["pkill","-f","/opt/google/chrome/chrome"], "start": "/opt/google/chrome/chrome"},
+    {"name": "Firefox",         "cat": "Browsers",
+     "match": "firefox",
+     "kill": ["pkill","-f","firefox"], "start": "firefox"},
+    # Communication
+    {"name": "Teams",           "cat": "Communication",
+     "match": "teams-for-linux",
+     "kill": ["flatpak","kill","com.github.IsmaelMartinez.teams_for_linux"],
+     "start": "flatpak run com.github.IsmaelMartinez.teams_for_linux"},
+    {"name": "Discord",         "cat": "Communication",
+     "match": "com.discordapp.Discord",
+     "kill": ["flatpak","kill","com.discordapp.Discord"],
+     "start": "flatpak run com.discordapp.Discord"},
+    {"name": "Zoom",            "cat": "Communication",
+     "match": "/usr/bin/zoom",
+     "kill": ["pkill","-f","/usr/bin/zoom"], "start": "/usr/bin/zoom"},
+    {"name": "Telegram",        "cat": "Communication",
+     "match": "org.telegram.desktop",
+     "kill": ["flatpak","kill","org.telegram.desktop"],
+     "start": "flatpak run org.telegram.desktop"},
+    {"name": "Thunderbird",     "cat": "Communication",
+     "match": "thunderbird",
+     "kill": ["pkill","-f","thunderbird"], "start": "thunderbird"},
+    {"name": "BlueMail",        "cat": "Communication",
+     "match": "net.blix.BlueMail",
+     "kill": ["flatpak","kill","net.blix.BlueMail"],
+     "start": "flatpak run net.blix.BlueMail"},
+    # Dev
+    {"name": "Postman",         "cat": "Dev",
+     "match": "com.getpostman.Postman",
+     "kill": ["flatpak","kill","com.getpostman.Postman"],
+     "start": "flatpak run com.getpostman.Postman"},
+    {"name": "Zed",             "cat": "Dev",
+     "match": "dev.zed.Zed",
+     "kill": ["flatpak","kill","dev.zed.Zed"],
+     "start": "flatpak run dev.zed.Zed"},
+    # Creative
+    {"name": "OBS Studio",      "cat": "Creative",
+     "match": "com.obsproject.Studio",
+     "kill": ["flatpak","kill","com.obsproject.Studio"],
+     "start": "flatpak run com.obsproject.Studio"},
+    {"name": "Kdenlive",        "cat": "Creative",
+     "match": "org.kde.kdenlive",
+     "kill": ["flatpak","kill","org.kde.kdenlive"],
+     "start": "flatpak run org.kde.kdenlive"},
+    {"name": "GIMP",            "cat": "Creative",
+     "match": "org.gimp.GIMP",
+     "kill": ["flatpak","kill","org.gimp.GIMP"],
+     "start": "flatpak run org.gimp.GIMP"},
+    {"name": "LibreOffice",     "cat": "Creative",
+     "match": "soffice",
+     "kill": ["pkill","-f","soffice"], "start": "libreoffice"},
+    {"name": "VLC",             "cat": "Creative",
+     "match": "org.videolan.VLC",
+     "kill": ["flatpak","kill","org.videolan.VLC"],
+     "start": "flatpak run org.videolan.VLC"},
+    # Servers
+    {"name": "Nginx",           "cat": "Servers",
+     "match": "nginx",
+     "kill": ["sudo","systemctl","stop","nginx"],
+     "start": "sudo systemctl start nginx",
+     "service": True, "service_name": "nginx"},
+    {"name": "Apache2",         "cat": "Servers",
+     "match": "apache2",
+     "kill": ["sudo","systemctl","stop","apache2"],
+     "start": "sudo systemctl start apache2",
+     "service": True, "service_name": "apache2"},
+    {"name": "PHP-FPM 8.3",     "cat": "Servers",
+     "match": "php-fpm",
+     "kill": ["sudo","systemctl","stop","php8.3-fpm"],
+     "start": "sudo systemctl start php8.3-fpm",
+     "service": True, "service_name": "php8.3-fpm"},
+    {"name": "PHP Dev Server",  "cat": "Servers",
+     "match": "php -S",
+     "kill": ["pkill","-f","php -S"],
+     "start": "sudo -u dhcpcd php -S [::]:8080 -t /var/www/html"},
+    {"name": "MySQL",           "cat": "Servers",
+     "match": "mysqld",
+     "kill": ["sudo","systemctl","stop","mysql"],
+     "start": "sudo systemctl start mysql",
+     "service": True, "service_name": "mysql"},
+    # Background
+    {"name": "Dropbox",         "cat": "Background",
+     "match": "dropbox",
+     "kill": ["pkill","-f","dropbox"],
+     "start": "~/.dropbox-dist/dropbox-lnx.*/dropbox start",
+     "start_glob": True},
+    {"name": "Claude Desktop",  "cat": "Background",
+     "match": "claude-desktop",
+     "kill": ["pkill","-f","claude-desktop"], "start": "claude-desktop"},
+    {"name": "Alpaca",          "cat": "Background",
+     "match": "com.jeffser.Alpaca",
+     "kill": ["flatpak","kill","com.jeffser.Alpaca"],
+     "start": "flatpak run com.jeffser.Alpaca"},
+    {"name": "Standard Notes",  "cat": "Background",
+     "match": "org.standardnotes.standardnotes",
+     "kill": ["flatpak","kill","org.standardnotes.standardnotes"],
+     "start": "flatpak run org.standardnotes.standardnotes"},
+]
+
+# ── Process scanner ──────────────────────────────────────────
+
+# Exact comm names that are always system/desktop — never show these
+SYSTEM_COMMS = frozenset([
+    "systemd", "(sd-pam)", "dbus-daemon", "dbus-run-session",
+    "NetworkManager", "wpa_supplicant", "dhcpcd", "dhclient",
+    "udevadm", "systemd-udevd", "systemd-logind", "systemd-resolved",
+    "systemd-networkd", "systemd-journald", "systemd-timesyncd",
+    "systemd-oomd", "systemd-userdbd", "systemd-hostnamed",
+    "polkitd", "avahi-daemon", "bluetoothd", "upowerd", "udisksd",
+    "colord", "rtkit-daemon", "accounts-daemon", "thermald", "irqbalance",
+    "rsyslogd", "cron", "atd", "sshd", "dnsmasq",
+    "at-spi-bus-launcher", "at-spi2-registryd",
+    "gvfsd", "gvfsd-fuse", "gvfsd-trash", "gvfsd-metadata",
+    "pipewire", "wireplumber", "pulseaudio", "pipewire-pulse",
+    "Xwayland", "gnome-keyring-daemon",
+    "xdg-desktop-portal", "xdg-document-portal", "xdg-permission-store",
+    "cosmic-comp", "cosmic-panel", "cosmic-workspaces", "cosmic-session",
+    "cosmic-settings-daemon", "cosmic-bg", "cosmic-osd", "cosmic-greeter",
+    "mission-center",
+    "ps", "pgrep", "grep", "awk", "sed", "cat",
+    "bash", "zsh", "sh", "fish", "dash",
+])
+
+# Substrings in args that mark a process as system — skip it
+SYSTEM_ARG_FRAGMENTS = [
+    "/usr/lib/systemd/", "/lib/systemd/",
+    "cosmic-ext-applet", "cosmic-files-applet",
+    "/usr/libexec/",
+    "xdg-desktop-portal",
+    "evolution-",
+    "goa-daemon",
+    "tracker-",
+    "killer",      # our own script
+]
+
+# Keywords for auto-categorising discovered apps
+AUTO_CAT = {
+    "Browsers":      ["chrome", "firefox", "brave", "opera", "vivaldi", "chromium", "epiphany", "midori"],
+    "Communication": ["discord", "telegram", "zoom", "teams", "thunderbird", "bluemail", "slack",
+                      "signal", "skype", "element", "fractal", "nheko", "mail"],
+    "Dev":           ["code", "zed", "postman", "pycharm", "idea", "clion", "rider", "nvim", "vim",
+                      "emacs", "sublime", "atom", "kate", "gedit", "dbeaver", "beekeeper"],
+    "Creative":      ["obs", "gimp", "kdenlive", "inkscape", "blender", "vlc", "mpv", "audacity",
+                      "darktable", "rawtherapee", "krita", "pitivi", "shotcut", "handbrake"],
+    "Servers":       ["nginx", "apache", "mysql", "mysqld", "postgres", "redis", "php-fpm",
+                      "gunicorn", "uvicorn", "caddy", "mongod"],
+    "Background":    ["dropbox", "nextcloud", "claude", "keybase", "syncthing", "megasync", "insync"],
+}
+
+def auto_categorize(comm, args):
+    key = f"{comm} {args}".lower()
+    for cat, keywords in AUTO_CAT.items():
+        if any(kw in key for kw in keywords):
+            return cat
+    return "Other"
+
+
+def scan_unknown_running(known_matches):
+    """Discover all user processes not covered by the APPS list."""
+    r = subprocess.run(
+        ["ps", "-u", getpass.getuser(), "-eo", "pid,rss,comm,args", "--no-headers"],
+        capture_output=True, text=True,
+    )
+    groups = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, rss, comm = int(parts[0]), int(parts[1]), parts[2]
+        except ValueError:
+            continue
+        args = parts[3] if len(parts) > 3 else comm
+
+        if args.startswith("["):                                    # kernel thread
+            continue
+        if comm in SYSTEM_COMMS:                                    # known system comm
+            continue
+        if any(f in args for f in SYSTEM_ARG_FRAGMENTS):           # system arg pattern
+            continue
+        if any(m in args for m in known_matches):                   # already in APPS
+            continue
+
+        if comm not in groups:
+            groups[comm] = {
+                "name": comm,
+                "cat":  auto_categorize(comm, args),
+                "match": comm,
+                "kill": ["pkill", "-x", comm],
+                "start": None,
+                "dynamic": True,
+                "_ram_kb": 0,
+            }
+        groups[comm]["_ram_kb"] += rss
+
+    return [
+        ({**g, "_ram_mb": g["_ram_kb"] // 1024}) for g in groups.values()
+    ]
+
+
+# ── Helpers ───────────────────────────────────────────────────
+
+def sh(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+def is_running(app):
+    if app.get("service"):
+        return sh(["systemctl","is-active","--quiet",app["service_name"]]).returncode == 0
+    return sh(["pgrep","-f",app["match"]]).returncode == 0
+
+def get_ram_mb(app):
+    r = sh(["ps","-eo","rss,args"])
+    total = 0
+    for line in r.stdout.splitlines():
+        if app["match"] in line and "killer" not in line and "pgrep" not in line:
+            try:
+                total += int(line.split()[0])
+            except (ValueError, IndexError):
+                pass
+    return total // 1024
+
+def kill_app(app):
+    subprocess.run(app["kill"], capture_output=True)
+
+def start_app(app):
+    if app.get("start") is None:
+        return
+    cmd = app["start"]
+    if app.get("service"):
+        subprocess.run(cmd, shell=True)
+        return
+    if app.get("start_glob"):
+        matches = glob.glob(os.path.expanduser(cmd.split()[0]))
+        if not matches:
+            return
+        cmd = matches[0] + " " + " ".join(cmd.split()[1:])
+    subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True,
+                     env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")})
+
+def drop_cache():
+    subprocess.run(["sync"])
+    subprocess.run(["sudo","tee","/proc/sys/vm/drop_caches"], input="3", text=True, capture_output=True)
+    subprocess.run(["sudo","swapoff","-a"], capture_output=True)
+    subprocess.run(["sudo","swapon","-a"], capture_output=True)
+
+def get_ram_info():
+    r = sh(["free","-m"])
+    for line in r.stdout.splitlines():
+        if line.startswith("Mem:"):
+            p = line.split()
+            total, avail = int(p[1]), int(p[6])
+            return total, avail, (total - avail) * 100 // total
+    return 1, 1, 0
+
+# ── Color pairs ───────────────────────────────────────────────
+P_TITLE   = 1
+P_TAB_ACT = 2
+P_TAB_OFF = 3
+P_HDR     = 4
+P_ON      = 5
+P_OFF     = 6
+P_SEL     = 7
+P_HINT    = 8
+P_WARN    = 9
+P_MSGOK   = 10
+P_MSGERR  = 11
+P_BAR     = 12
+
+# ── Column layout (0-indexed) ─────────────────────────────────
+#  0  indicator+number  (8 chars)
+#  8  name              (21 chars)
+# 30  status            (8 chars)
+# 39  ram               (9 chars)
+# 49  bar               (12 chars)
+COL_NUM  = 0
+COL_NAME = 8
+COL_STAT = 30
+COL_RAM  = 39
+COL_BAR  = 49
+
+def ram_str(running, mb):
+    if not running:
+        return f"{'--':>6}   "
+    return f"{mb:>6} MB" if mb > 0 else f"{'<1':>6} MB"
+
+def ram_bar(running, mb):
+    if not running or mb == 0:
+        return "░" * 10
+    return "█" * min(int(mb / 1000 * 10), 10) + "░" * max(0, 10 - int(mb / 1000 * 10))
+
+
+class KillerUI:
+    def __init__(self, scr):
+        self.scr  = scr
+        self.tab  = 0
+        self.sel  = 0
+        self.scroll = 0
+        self.state  = []
+        self.msg     = ""
+        self.msg_ok  = True
+        self.msg_ts  = 0
+        self.num_buf = ""
+        self._init()
+
+    def _init(self):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(P_TITLE,   curses.COLOR_WHITE,  curses.COLOR_BLUE)
+        curses.init_pair(P_TAB_ACT, curses.COLOR_BLACK,  curses.COLOR_CYAN)
+        curses.init_pair(P_TAB_OFF, curses.COLOR_WHITE,  -1)
+        curses.init_pair(P_HDR,     curses.COLOR_CYAN,   -1)
+        curses.init_pair(P_ON,      curses.COLOR_GREEN,  -1)
+        curses.init_pair(P_OFF,     curses.COLOR_RED,    -1)
+        curses.init_pair(P_SEL,     curses.COLOR_BLACK,  curses.COLOR_WHITE)
+        curses.init_pair(P_HINT,    curses.COLOR_BLACK,  curses.COLOR_CYAN)
+        curses.init_pair(P_WARN,    curses.COLOR_YELLOW, -1)
+        curses.init_pair(P_MSGOK,   curses.COLOR_BLACK,  curses.COLOR_GREEN)
+        curses.init_pair(P_MSGERR,  curses.COLOR_WHITE,  curses.COLOR_RED)
+        curses.init_pair(P_BAR,     curses.COLOR_GREEN,  -1)
+        curses.curs_set(0)
+        curses.noecho()
+        curses.cbreak()
+        self.scr.keypad(True)
+        self.scr.timeout(4000)
+
+    # ── State ─────────────────────────────────────────────────
+
+    def refresh(self):
+        known_state   = [(a, is_running(a), get_ram_mb(a)) for a in APPS]
+        known_matches = [a["match"] for a in APPS]
+        dynamic_apps  = scan_unknown_running(known_matches)
+        dynamic_state = [(a, True, a["_ram_mb"]) for a in dynamic_apps]
+        self.state    = known_state + dynamic_state
+
+    def tab_apps(self):
+        cat = CATEGORIES[self.tab]
+        if cat == "All":
+            return self.state
+        return [(a, r, m) for a, r, m in self.state if a["cat"] == cat]
+
+    def clamp_sel(self):
+        n = len(self.tab_apps())
+        self.sel = max(0, min(self.sel, n - 1)) if n else 0
+
+    def notify(self, text, ok=True):
+        self.msg, self.msg_ok, self.msg_ts = text, ok, time.time()
+
+    # ── Drawing ───────────────────────────────────────────────
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        try:
+            self.scr.addstr(y, x, text[:w - x], attr)
+        except curses.error:
+            pass
+
+    def fill(self, y, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h:
+            try:
+                self.scr.addstr(y, 0, " " * w, attr)
+            except curses.error:
+                pass
+
+    def draw(self):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        if h < 8 or w < 50:
+            self.put(0, 0, "Terminal too small (need 50×8 minimum)")
+            self.scr.refresh()
+            return
+        total, avail, pct = get_ram_info()
+        self._draw_title(w, total, avail, pct)
+        self._draw_tabs(w)
+        self._draw_header(w)
+        self._draw_list(top=3, rows=h - 5, w=w)
+        self._draw_footer(h - 2, h - 1, w)
+        self.scr.refresh()
+
+    def _draw_title(self, w, total, avail, pct):
+        self.fill(0, curses.color_pair(P_TITLE))
+        self.put(0, 0, " KILLER", curses.color_pair(P_TITLE) | curses.A_BOLD)
+        rc = curses.color_pair(P_OFF) if pct > 80 else (curses.color_pair(P_WARN) if pct > 60 else curses.color_pair(P_ON))
+        label = f"RAM {pct}%  {avail} MB free / {total} MB "
+        self.put(0, max(8, w - len(label)), label, curses.color_pair(P_TITLE) | curses.A_BOLD)
+
+    def _draw_tabs(self, w):
+        self.fill(1, curses.color_pair(P_TAB_OFF))
+        x = 1
+        for i, cat in enumerate(CATEGORIES):
+            n_running = sum(1 for a, r, _ in self.state if r and (cat == "All" or a["cat"] == cat))
+            label = f" {cat}"
+            if n_running:
+                label += f" ({n_running})"
+            label += " "
+            attr = (curses.color_pair(P_TAB_ACT) | curses.A_BOLD) if i == self.tab else curses.color_pair(P_TAB_OFF)
+            self.put(1, x, label, attr)
+            x += len(label) + 1
+            if x >= w - 4:
+                break
+
+    def _draw_header(self, w):
+        self.fill(2, curses.color_pair(P_HDR))
+        hdr_attr = curses.color_pair(P_HDR) | curses.A_BOLD
+        self.put(2, COL_NUM,  "  #  ",          hdr_attr)
+        self.put(2, COL_NAME, f"{'Application':<21}", hdr_attr)
+        self.put(2, COL_STAT, f"{'Status':<8}", hdr_attr)
+        self.put(2, COL_RAM,  f"{'RAM':>9}",    hdr_attr)
+        self.put(2, COL_BAR,  "  Usage",         hdr_attr)
+
+    def _draw_list(self, top, rows, w):
+        apps = self.tab_apps()
+        if not apps:
+            self.put(top, 2, "(no apps in this category)", curses.A_DIM)
+            return
+
+        if self.sel < self.scroll:
+            self.scroll = self.sel
+        elif self.sel >= self.scroll + rows:
+            self.scroll = self.sel - rows + 1
+
+        for i, (app, running, mb) in enumerate(apps[self.scroll: self.scroll + rows]):
+            abs_i = i + self.scroll
+            y = top + i
+            sel = abs_i == self.sel
+
+            if sel:
+                self.fill(y, curses.color_pair(P_SEL))
+
+            base = curses.color_pair(P_SEL) if sel else 0
+            ind  = "▶" if sel else " "
+
+            # indicator + number
+            self.put(y, COL_NUM, f"  {ind} {abs_i + 1:<3}", base | curses.A_BOLD)
+
+            # name  (~prefix for auto-detected apps with no start command)
+            prefix = "~" if app.get("dynamic") else " "
+            name   = (prefix + app["name"])[:21]
+            self.put(y, COL_NAME, f"{name:<21}", base)
+
+            # status (colored unless selected)
+            if running:
+                st_attr = curses.color_pair(P_SEL) if sel else (curses.color_pair(P_ON) | curses.A_BOLD)
+                self.put(y, COL_STAT, f"{'ON':<8}", st_attr)
+            else:
+                st_attr = curses.color_pair(P_SEL) if sel else (curses.color_pair(P_OFF) | curses.A_BOLD)
+                self.put(y, COL_STAT, f"{'OFF':<8}", st_attr)
+
+            # RAM
+            self.put(y, COL_RAM, f"{ram_str(running, mb):>9}", base)
+
+            # bar
+            bar = ram_bar(running, mb)
+            bar_attr = curses.color_pair(P_SEL) if sel else (curses.color_pair(P_BAR) if running else curses.A_DIM)
+            self.put(y, COL_BAR, f"  {bar}", bar_attr)
+
+    def _draw_footer(self, sep_y, hint_y, w):
+        if self.msg and time.time() - self.msg_ts < 3:
+            attr = curses.color_pair(P_MSGOK) if self.msg_ok else curses.color_pair(P_MSGERR)
+            self.fill(sep_y, attr)
+            self.put(sep_y, 1, self.msg[:w - 2], attr | curses.A_BOLD)
+        else:
+            self.put(sep_y, 0, "─" * w, curses.color_pair(P_HDR))
+
+        self.fill(hint_y, curses.color_pair(P_HINT))
+        if self.num_buf:
+            hint = f" Jump to #: {self.num_buf}_   (Enter to toggle, Esc to cancel)"
+        else:
+            hint = " ↑↓ nav   enter/spc toggle   ←→/tab switch   a stop-all   c drop-cache   X FULL RESET   q quit "
+        self.put(hint_y, 0, hint[:w], curses.color_pair(P_HINT) | curses.A_BOLD)
+
+    def _toggle(self, entry):
+        app, running, _ = entry
+        if running:
+            self.notify(f" Stopping {app['name']}...")
+            self.draw()
+            kill_app(app)
+            time.sleep(0.5)
+        elif app.get("dynamic"):
+            self.notify(f" {app['name']} has no start command (auto-detected)", ok=False)
+        else:
+            self.notify(f" Starting {app['name']}...")
+            self.draw()
+            start_app(app)
+            time.sleep(1)
+
+    # ── Full reset ────────────────────────────────────────────
+
+    def _confirm_reset(self):
+        h, w = self.scr.getmaxyx()
+        dh, dw = 16, 62
+        dy, dx = max(0, (h - dh) // 2), max(0, (w - dw) // 2)
+        buf = ""
+
+        danger = curses.color_pair(P_MSGERR) | curses.A_BOLD
+        danger_dim = curses.color_pair(P_MSGERR)
+
+        while True:
+            # Fill dialog background
+            for y in range(dh):
+                try:
+                    self.scr.addstr(dy + y, dx, " " * dw, curses.color_pair(P_MSGERR))
+                except curses.error:
+                    pass
+
+            # Border
+            self.put(dy,          dx, "╔" + "═" * (dw - 2) + "╗", danger)
+            self.put(dy + dh - 1, dx, "╚" + "═" * (dw - 2) + "╝", danger)
+            for y in range(1, dh - 1):
+                self.put(dy + y, dx,          "║", danger)
+                self.put(dy + y, dx + dw - 1, "║", danger)
+
+            # Title
+            title = "  ⚠  FULL RESET  ⚠  "
+            self.put(dy + 1, dx + (dw - len(title)) // 2, title, danger)
+            self.put(dy + 2, dx + 1, "═" * (dw - 2), danger)
+
+            # Body
+            lines = [
+                "",
+                "  This will kill ALL non-system processes:",
+                "    • Every app across all categories",
+                "    • All background services",
+                "    • MySQL, Nginx, Apache, PHP-FPM",
+                "    • Drop disk cache + reclaim swap",
+                "",
+                "  Only COSMIC desktop processes will remain.",
+                "",
+                '  Type  YES  and press Enter to confirm',
+                "  Press Esc to cancel",
+                "",
+                f'  > {buf}_',
+            ]
+            for i, line in enumerate(lines):
+                self.put(dy + 3 + i, dx + 1, line[: dw - 2], danger_dim)
+
+            self.scr.refresh()
+            k = self.scr.getch()
+
+            if k == 27:
+                return False
+            elif k in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                return buf.strip().upper() == "YES"
+            elif k in (curses.KEY_BACKSPACE, 127):
+                buf = buf[:-1]
+            elif 32 <= k <= 126 and len(buf) < 8:
+                buf += chr(k)
+
+    def _do_full_reset(self):
+        KEEP = [
+            "cosmic", "xdg-desktop-portal", "pipewire", "wireplumber",
+            "dbus", "systemd", "NetworkManager", "wpa_supplicant",
+            "gnome-keyring", "polkit", "Xwayland", "python3", "killer",
+            "zsh", "bash", "sh", "fish", "gvfsd", "gvfs", "at-spi",
+            "upower", "udisks2", "bluetooth", "avahi", "colord", "rtkit",
+            "tracker", "ibus", "fcitx", "ssh-agent", "sshd", "cron",
+            "notification", "portal",
+        ]
+
+        # Walk up to find ancestor PIDs (our terminal chain — never kill these)
+        ancestors = set()
+        pid = os.getpid()
+        while pid > 1:
+            try:
+                with open(f"/proc/{pid}/status") as f:
+                    for line in f:
+                        if line.startswith("PPid:"):
+                            pid = int(line.split()[1])
+                            ancestors.add(pid)
+                            break
+                    else:
+                        break
+            except OSError:
+                break
+
+        my_pid = os.getpid()
+
+        # 1. Stop all services gracefully
+        for app in APPS:
+            if app.get("service"):
+                subprocess.run(app["kill"], capture_output=True)
+
+        # 2. Kill all known app processes
+        for app in APPS:
+            if not app.get("service"):
+                subprocess.run(app["kill"], capture_output=True)
+
+        time.sleep(0.5)
+
+        # 3. Kill remaining user processes not in whitelist
+        user = getpass.getuser()
+        r = subprocess.run(
+            ["ps", "-u", user, "-o", "pid,args", "--no-headers"],
+            capture_output=True, text=True,
+        )
+        to_kill = []
+        for line in r.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if pid == my_pid or pid in ancestors:
+                continue
+            args = parts[1].lower()
+            if not any(p.lower() in args for p in KEEP):
+                to_kill.append(pid)
+
+        # SIGTERM first, then SIGKILL stragglers
+        for pid in to_kill:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(1)
+        for pid in to_kill:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+        # 4. Drop cache + reclaim swap
+        drop_cache()
+
+    # ── Input loop ────────────────────────────────────────────
+
+    def run(self):
+        self.refresh()
+        last_ref = time.time()
+
+        while True:
+            self.draw()
+            k = self.scr.getch()
+
+            if time.time() - last_ref > 4:
+                self.refresh()
+                last_ref = time.time()
+
+            if k == -1:
+                self.refresh()
+                last_ref = time.time()
+                continue
+
+            apps = self.tab_apps()
+
+            if k in (ord('q'), ord('Q')):
+                break
+
+            elif k in (ord('r'), ord('R')):
+                self.refresh()
+                last_ref = time.time()
+                self.notify(" Refreshed")
+
+            elif k in (curses.KEY_RIGHT, ord('\t'), 9):
+                self.num_buf = ""
+                self.tab = (self.tab + 1) % len(CATEGORIES)
+                self.scroll = 0
+                self.clamp_sel()
+
+            elif k == curses.KEY_LEFT:
+                self.num_buf = ""
+                self.tab = (self.tab - 1) % len(CATEGORIES)
+                self.scroll = 0
+                self.clamp_sel()
+
+            elif k == curses.KEY_UP:
+                self.num_buf = ""
+                if self.sel > 0:
+                    self.sel -= 1
+
+            elif k == curses.KEY_DOWN:
+                self.num_buf = ""
+                if self.sel < len(apps) - 1:
+                    self.sel += 1
+
+            elif k == 27:  # Escape
+                self.num_buf = ""
+
+            elif k in (curses.KEY_BACKSPACE, 127):
+                self.num_buf = self.num_buf[:-1]
+
+            elif k in (curses.KEY_ENTER, ord('\n'), ord('\r'), ord(' ')):
+                if self.num_buf:
+                    idx = int(self.num_buf) - 1
+                    self.num_buf = ""
+                    if 0 <= idx < len(apps):
+                        self.sel = idx
+                        self._toggle(apps[idx])
+                        self.refresh()
+                        last_ref = time.time()
+                    else:
+                        self.notify(f" No app #{idx + 1} in this tab", ok=False)
+                elif apps:
+                    self._toggle(apps[self.sel])
+                    self.refresh()
+                    last_ref = time.time()
+
+            elif k in (ord('a'), ord('A')):
+                to_stop = [(a, r, m) for a, r, m in apps if r]
+                if to_stop:
+                    self.notify(f" Stopping {len(to_stop)} apps in this tab...")
+                    self.draw()
+                    for a, _, _ in to_stop:
+                        kill_app(a)
+                    time.sleep(1)
+                    self.refresh()
+                    last_ref = time.time()
+                    self.notify(f" Stopped {len(to_stop)} apps")
+                else:
+                    self.notify(" No running apps in this tab", ok=False)
+
+            elif k in (ord('c'), ord('C')):
+                self.notify(" Dropping cache + reclaiming swap...")
+                self.draw()
+                drop_cache()
+                self.refresh()
+                last_ref = time.time()
+                self.notify(" Cache cleared and swap reclaimed!")
+
+            elif k == ord('X'):
+                if self._confirm_reset():
+                    self.notify(" Running full reset...")
+                    self.draw()
+                    self._do_full_reset()
+                    self.refresh()
+                    last_ref = time.time()
+                    self.notify(" Full reset complete — only COSMIC remains")
+
+            elif ord('0') <= k <= ord('9'):
+                self.num_buf += chr(k)
+                # auto-jump selection to give visual feedback
+                idx = int(self.num_buf) - 1
+                if 0 <= idx < len(apps):
+                    self.sel = idx
+
+
+def main(scr):
+    KillerUI(scr).run()
+
+
+if __name__ == "__main__":
+    if not sys.stdout.isatty():
+        print("killer: must be run in a terminal")
+        sys.exit(1)
+    curses.wrapper(main)
